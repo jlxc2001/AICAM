@@ -16,7 +16,7 @@ import java.util.List;
  * 战斗 HUD 风格识别框悬浮层（静态轻量版）
  *
  * 特点：
- * 1. 识别框严格贴合目标检测框，不再做放大/收缩动画。
+ * 1. 识别框严格贴合目标检测框，不做放大/收缩动画。
  * 2. 去掉扫描动画，降低低配车机负担。
  * 3. 保留 TRACK / LOCK / LOCKED 状态与颜色变化。
  * 4. 保留轻量战斗机风格角框与中心准星。
@@ -322,19 +322,15 @@ public class DetectionOverlayView extends View {
     private void drawLockCorners(Canvas canvas, RectF r) {
         float corner = Math.max(dp(10f), Math.min(Math.min(r.width(), r.height()) * 0.22f, dp(26f)));
 
-        // 左上
         canvas.drawLine(r.left, r.top, r.left + corner, r.top, hudPaint);
         canvas.drawLine(r.left, r.top, r.left, r.top + corner, hudPaint);
 
-        // 右上
         canvas.drawLine(r.right - corner, r.top, r.right, r.top, hudPaint);
         canvas.drawLine(r.right, r.top, r.right, r.top + corner, hudPaint);
 
-        // 左下
         canvas.drawLine(r.left, r.bottom - corner, r.left, r.bottom, hudPaint);
         canvas.drawLine(r.left, r.bottom, r.left + corner, r.bottom, hudPaint);
 
-        // 右下
         canvas.drawLine(r.right - corner, r.bottom, r.right, r.bottom, hudPaint);
         canvas.drawLine(r.right, r.bottom - corner, r.right, r.bottom, hudPaint);
     }
