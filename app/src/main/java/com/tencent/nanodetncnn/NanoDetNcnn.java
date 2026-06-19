@@ -1,22 +1,25 @@
 package com.tencent.nanodetncnn;
 
 import android.content.res.AssetManager;
-import android.graphics.Bitmap;
-import android.view.Surface;
+
+import java.nio.ByteBuffer;
 
 public class NanoDetNcnn {
-    public native boolean loadModel(AssetManager mgr, int modelid, int cpugpu);
-
-    // 原项目相机接口保留，避免其他代码引用时编译报错。
-    public native boolean openCamera(int facing);
-    public native boolean closeCamera();
-    public native boolean setOutputWindow(Surface surface);
-
-    // 新增：对屏幕截帧 Bitmap 做 NanoDet 识别。
-    // 返回格式：float[]{srcW, srcH, label, prob, x, y, w, h, label, prob, x, y, w, h ...}
-    public native float[] detectBitmap(Bitmap bitmap);
-
     static {
         System.loadLibrary("nanodetncnn");
     }
+
+    /**
+     * modelid 当前只使用 3，也就是 nanodet-ELite0_320。
+     * cpugpu 当前建议固定 0，低配/32位车机更稳。
+     */
+    public native boolean loadModel(AssetManager mgr, int modelid, int cpugpu);
+
+    /**
+     * 返回格式：
+     * result[0] = 原始录屏帧宽度
+     * result[1] = 原始录屏帧高度
+     * 后续每个目标 6 个 float：label, prob, x, y, w, h
+     */
+    public native float[] detectRGBA(ByteBuffer rgba, int width, int height, int rowStride, int targetSize);
 }

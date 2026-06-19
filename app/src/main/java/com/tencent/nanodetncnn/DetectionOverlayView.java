@@ -12,22 +12,6 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
-/**
- * 战斗 HUD 风格识别框悬浮层（静态轻量版）
- *
- * 特点：
- * 1. 识别框严格贴合目标检测框，不做放大/收缩动画。
- * 2. 去掉扫描动画，降低低配车机负担。
- * 3. 保留 TRACK / LOCK / LOCKED 状态与颜色变化。
- * 4. 保留轻量战斗机风格角框与中心准星。
- *
- * 适配 ScreenDetectService 当前调用方式：
- *   overlayView.updateDetections(float[] result);
- *   overlayView.clear();
- *
- * result 格式：
- *   float[]{srcW, srcH, label, prob, x, y, w, h, label, prob, x, y, w, h ...}
- */
 public class DetectionOverlayView extends View {
     private static final String[] CLASS_NAMES = {
             "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -45,7 +29,6 @@ public class DetectionOverlayView extends View {
 
     private static final long TRACK_STALE_MS = 700L;
     private static final float MATCH_DISTANCE_FACTOR = 0.16f;
-
     private static final float LOCK_THRESHOLD = 0.60f;
     private static final float LOCKED_THRESHOLD = 0.80f;
 
@@ -56,7 +39,6 @@ public class DetectionOverlayView extends View {
     private final Object lock = new Object();
     private final List<Track> tracks = new ArrayList<Track>();
     private long nextTrackId = 1L;
-
     private float sourceWidth = 1f;
     private float sourceHeight = 1f;
 
@@ -66,9 +48,7 @@ public class DetectionOverlayView extends View {
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textBoxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-    private enum LockLevel {
-        TRACK, LOCK, LOCKED
-    }
+    private enum LockLevel { TRACK, LOCK, LOCKED }
 
     private static class Track {
         long id;
@@ -105,7 +85,6 @@ public class DetectionOverlayView extends View {
 
     private void init() {
         setWillNotDraw(false);
-
         hudPaint.setStyle(Paint.Style.STROKE);
         hudPaint.setStrokeWidth(dp(2.0f));
         hudPaint.setStrokeCap(Paint.Cap.SQUARE);
@@ -148,9 +127,7 @@ public class DetectionOverlayView extends View {
                 float w = result[i + 4];
                 float h = result[i + 5];
 
-                if (w < 2f || h < 2f || prob <= 0f) {
-                    continue;
-                }
+                if (w < 2f || h < 2f || prob <= 0f) continue;
 
                 Detection d = new Detection();
                 d.label = label;
@@ -160,10 +137,8 @@ public class DetectionOverlayView extends View {
                 d.centerY = d.rect.centerY();
                 detections.add(d);
             }
-
             updateTracksLocked(detections, now);
         }
-
         invalidate();
     }
 
@@ -177,7 +152,6 @@ public class DetectionOverlayView extends View {
     private void updateTracksLocked(List<Detection> detections, long now) {
         boolean[] used = new boolean[tracks.size()];
         List<Track> newOrUpdated = new ArrayList<Track>();
-
         float diag = (float) Math.hypot(sourceWidth, sourceHeight);
         float matchMaxDist = Math.max(24f, diag * MATCH_DISTANCE_FACTOR);
 
@@ -188,14 +162,11 @@ public class DetectionOverlayView extends View {
 
             for (int i = 0; i < tracks.size(); i++) {
                 if (used[i]) continue;
-
                 Track t = tracks.get(i);
                 if (t.label != d.label) continue;
-
                 float dx = t.centerX - d.centerX;
                 float dy = t.centerY - d.centerY;
                 float dist = (float) Math.hypot(dx, dy);
-
                 if (dist < bestScore && dist < matchMaxDist) {
                     bestScore = dist;
                     best = t;
@@ -232,13 +203,10 @@ public class DetectionOverlayView extends View {
 
         tracks.clear();
         tracks.addAll(newOrUpdated);
-
         Iterator<Track> it = tracks.iterator();
         while (it.hasNext()) {
             Track t = it.next();
-            if (now - t.lastSeenTime > TRACK_STALE_MS) {
-                it.remove();
-            }
+            if (now - t.lastSeenTime > TRACK_STALE_MS) it.remove();
         }
     }
 
@@ -249,7 +217,6 @@ public class DetectionOverlayView extends View {
         List<Track> snapshot = new ArrayList<Track>();
         float srcW;
         float srcH;
-
         synchronized (lock) {
             snapshot.addAll(tracks);
             srcW = sourceWidth;
@@ -257,10 +224,7 @@ public class DetectionOverlayView extends View {
         }
 
         drawHudHeader(canvas, snapshot.size());
-
-        if (snapshot.isEmpty()) {
-            return;
-        }
+        if (snapshot.isEmpty()) return;
 
         float scaleX = getWidth() / Math.max(1f, srcW);
         float scaleY = getHeight() / Math.max(1f, srcH);
@@ -272,14 +236,10 @@ public class DetectionOverlayView extends View {
                     t.rect.right * scaleX,
                     t.rect.bottom * scaleY
             );
-
-            if (r.width() < dp(8f) || r.height() < dp(8f)) {
-                continue;
-            }
+            if (r.width() < dp(8f) || r.height() < dp(8f)) continue;
 
             LockLevel level = getLockLevel(t.prob);
             applyColor(getColorForLevel(level));
-
             drawLockCorners(canvas, r);
             drawCenterReticle(canvas, r);
             drawLabel(canvas, r, t, level);
@@ -309,28 +269,19 @@ public class DetectionOverlayView extends View {
     private void drawHudHeader(Canvas canvas, int count) {
         thinPaint.setColor(COLOR_TRACK);
         textPaint.setColor(COLOR_TRACK);
-
-        String text = "HUD TRACK  TARGETS:" + count;
-        float x = dp(10f);
-        float y = dp(18f);
-
         canvas.drawLine(dp(8f), dp(8f), dp(96f), dp(8f), thinPaint);
         canvas.drawLine(dp(8f), dp(8f), dp(8f), dp(25f), thinPaint);
-        canvas.drawText(text, x, y, textPaint);
+        canvas.drawText("HUD TRACK  TARGETS:" + count, dp(10f), dp(18f), textPaint);
     }
 
     private void drawLockCorners(Canvas canvas, RectF r) {
         float corner = Math.max(dp(10f), Math.min(Math.min(r.width(), r.height()) * 0.22f, dp(26f)));
-
         canvas.drawLine(r.left, r.top, r.left + corner, r.top, hudPaint);
         canvas.drawLine(r.left, r.top, r.left, r.top + corner, hudPaint);
-
         canvas.drawLine(r.right - corner, r.top, r.right, r.top, hudPaint);
         canvas.drawLine(r.right, r.top, r.right, r.top + corner, hudPaint);
-
         canvas.drawLine(r.left, r.bottom - corner, r.left, r.bottom, hudPaint);
         canvas.drawLine(r.left, r.bottom, r.left + corner, r.bottom, hudPaint);
-
         canvas.drawLine(r.right - corner, r.bottom, r.right, r.bottom, hudPaint);
         canvas.drawLine(r.right, r.bottom - corner, r.right, r.bottom, hudPaint);
     }
@@ -341,7 +292,6 @@ public class DetectionOverlayView extends View {
         float radius = Math.min(r.width(), r.height()) * 0.07f;
         radius = Math.max(dp(4f), Math.min(dp(10f), radius));
         float arm = radius + dp(4f);
-
         canvas.drawCircle(cx, cy, radius, centerPaint);
         canvas.drawLine(cx - arm, cy, cx - radius, cy, centerPaint);
         canvas.drawLine(cx + radius, cy, cx + arm, cy, centerPaint);
@@ -350,22 +300,11 @@ public class DetectionOverlayView extends View {
     }
 
     private void drawLabel(Canvas canvas, RectF r, Track t, LockLevel level) {
-        String state;
-        if (level == LockLevel.LOCKED) {
-            state = "LOCKED";
-        } else if (level == LockLevel.LOCK) {
-            state = "LOCK";
-        } else {
-            state = "TRACK";
-        }
-
-        String name = getClassName(t.label).toUpperCase();
-        String tag = state + " TGT-" + t.id + " " + name + " " + Math.round(t.prob * 100f) + "%";
-
+        String state = level == LockLevel.LOCKED ? "LOCKED" : (level == LockLevel.LOCK ? "LOCK" : "TRACK");
+        String tag = state + " TGT-" + t.id + " " + getClassName(t.label).toUpperCase() + " " + Math.round(t.prob * 100f) + "%";
         float padding = dp(4f);
         float textW = textPaint.measureText(tag);
         float boxH = dp(16f);
-
         float left = r.left;
         float top = Math.max(dp(4f), r.top - boxH - dp(6f));
         float right = left + textW + padding * 2f;
@@ -383,15 +322,12 @@ public class DetectionOverlayView extends View {
 
         canvas.drawLine(r.left, r.top, r.left, top + boxH * 0.5f, thinPaint);
         canvas.drawLine(r.left, top + boxH * 0.5f, left + dp(8f), top + boxH * 0.5f, thinPaint);
-
         canvas.drawRect(left + dp(8f), top, right + dp(8f), bottom, textBoxPaint);
         canvas.drawText(tag, left + dp(8f) + padding, top + boxH - dp(4f), textPaint);
     }
 
     private String getClassName(int label) {
-        if (label >= 0 && label < CLASS_NAMES.length) {
-            return CLASS_NAMES[label];
-        }
+        if (label >= 0 && label < CLASS_NAMES.length) return CLASS_NAMES[label];
         return "target";
     }
 

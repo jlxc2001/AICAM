@@ -5,100 +5,71 @@ import android.content.Context;
 import android.content.Intent;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
+import android.os.Build;
 import android.provider.Settings;
 import android.view.View;
-import android.view.WindowManager;
-import android.widget.AdapterView;
 import android.widget.Button;
-import android.widget.Spinner;
+import android.widget.TextView;
 import android.widget.Toast;
 
 public class MainActivity extends Activity {
-    private static final int REQUEST_MEDIA_PROJECTION = 2001;
-    private static final int REQUEST_OVERLAY = 2002;
+    private static final int REQUEST_MEDIA_PROJECTION = 1001;
+    private static final int REQUEST_OVERLAY = 1002;
 
-    private Spinner spinnerModel;
-    private Spinner spinnerCPUGPU;
-    private int currentModel = 3; // 默认 ELite0_320，比较适合弱性能/32 位设备
-    private int currentCpuGpu = 0; // 默认 CPU
+    private final NanoDetNcnn nanoDet = new NanoDetNcnn();
+    private TextView statusView;
+    private MediaProjectionManager projectionManager;
 
     @Override
-    public void onCreate(Bundle savedInstanceState) {
+    protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        spinnerModel = (Spinner) findViewById(R.id.spinnerModel);
-        spinnerCPUGPU = (Spinner) findViewById(R.id.spinnerCPUGPU);
+        statusView = findViewById(R.id.status);
+        projectionManager = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
 
-        spinnerModel.setSelection(currentModel);
-        spinnerCPUGPU.setSelection(currentCpuGpu);
+        boolean loaded = nanoDet.loadModel(getAssets(), 3, 0);
+        statusView.setText(loaded
+                ? "模型已加载：NanoDet ELite0 320 / CPU / armeabi-v7a"
+                : "模型加载失败：请检查 assets 模型文件");
 
-        spinnerModel.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                currentModel = position;
-            }
+        Button start = findViewById(R.id.startScreenDetect);
+        Button stop = findViewById(R.id.stopScreenDetect);
 
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-
-        spinnerCPUGPU.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                currentCpuGpu = position;
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-
-        Button start = (Button) findViewById(R.id.buttonStartScreenDetect);
         start.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startScreenDetectFlow();
+                startScreenDetect();
             }
         });
 
-        Button stop = (Button) findViewById(R.id.buttonStopScreenDetect);
         stop.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                Intent intent = new Intent(MainActivity.this, ScreenDetectService.class);
-                intent.setAction(ScreenDetectService.ACTION_STOP);
-                startService(intent);
+                stopScreenDetect();
             }
         });
     }
 
-    private void startScreenDetectFlow() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "请先允许悬浮窗权限", Toast.LENGTH_LONG).show();
-            Intent intent = new Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName())
-            );
+    private void startScreenDetect() {
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "请先允许悬浮窗权限", Toast.LENGTH_SHORT).show();
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
             startActivityForResult(intent, REQUEST_OVERLAY);
             return;
         }
 
-        requestScreenCapture();
+        Intent captureIntent = projectionManager.createScreenCaptureIntent();
+        startActivityForResult(captureIntent, REQUEST_MEDIA_PROJECTION);
     }
 
-    private void requestScreenCapture() {
-        MediaProjectionManager manager =
-                (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        if (manager == null) {
-            Toast.makeText(this, "无法获取 MediaProjectionManager", Toast.LENGTH_LONG).show();
-            return;
-        }
-        startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION);
+    private void stopScreenDetect() {
+        Intent intent = new Intent(this, ScreenDetectService.class);
+        intent.setAction(ScreenDetectService.ACTION_STOP);
+        startService(intent);
+        statusView.setText("已发送停止识别指令");
     }
 
     @Override
@@ -106,7 +77,11 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
 
         if (requestCode == REQUEST_OVERLAY) {
-            startScreenDetectFlow();
+            if (Settings.canDrawOverlays(this)) {
+                startScreenDetect();
+            } else {
+                Toast.makeText(this, "没有悬浮窗权限，无法显示识别框", Toast.LENGTH_SHORT).show();
+            }
             return;
         }
 
@@ -117,10 +92,9 @@ public class MainActivity extends Activity {
             }
 
             Intent intent = new Intent(this, ScreenDetectService.class);
+            intent.setAction(ScreenDetectService.ACTION_START);
             intent.putExtra(ScreenDetectService.EXTRA_RESULT_CODE, resultCode);
-            intent.putExtra(ScreenDetectService.EXTRA_RESULT_DATA, data);
-            intent.putExtra(ScreenDetectService.EXTRA_MODEL_ID, currentModel);
-            intent.putExtra(ScreenDetectService.EXTRA_CPU_GPU, currentCpuGpu);
+            intent.putExtra(ScreenDetectService.EXTRA_DATA, data);
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent);
@@ -128,7 +102,8 @@ public class MainActivity extends Activity {
                 startService(intent);
             }
 
-            Toast.makeText(this, "屏幕识别已启动，可切到其他界面测试", Toast.LENGTH_SHORT).show();
+            statusView.setText("屏幕识别已启动。现在可以切到摄像头预览 App。");
+            Toast.makeText(this, "屏幕识别已启动", Toast.LENGTH_SHORT).show();
         }
     }
 }

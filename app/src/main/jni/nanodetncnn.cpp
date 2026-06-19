@@ -1,338 +1,327 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2021 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
-
-#include <android/asset_manager_jni.h>
-#include <android/native_window_jni.h>
-#include <android/native_window.h>
-#include <android/bitmap.h>
-#include <android/log.h>
 #include <jni.h>
+#include <android/asset_manager_jni.h>
+#include <android/log.h>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
-
-#include <platform.h>
-#include <benchmark.h>
-
-#include "nanodet.h"
-#include "ndkcamera.h"
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
-#if __ARM_NEON
-#include <arm_neon.h>
-#endif // __ARM_NEON
+#include "net.h"
+#include "cpu.h"
 
-static int draw_unsupported(cv::Mat& rgb)
-{
-    const char text[] = "unsupported";
+#define TAG "AICAM-NanoDet"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-    int baseLine = 0;
-    cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 1.0, 1, &baseLine);
-
-    int y = (rgb.rows - label_size.height) / 2;
-    int x = (rgb.cols - label_size.width) / 2;
-
-    cv::rectangle(rgb, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)),
-                  cv::Scalar(255, 255, 255), -1);
-    cv::putText(rgb, text, cv::Point(x, y + label_size.height),
-                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 0));
-
-    return 0;
-}
-
-static int draw_fps(cv::Mat& rgb)
-{
-    float avg_fps = 0.f;
-    {
-        static double t0 = 0.f;
-        static float fps_history[10] = {0.f};
-
-        double t1 = ncnn::get_current_time();
-        if (t0 == 0.f)
-        {
-            t0 = t1;
-            return 0;
-        }
-
-        float fps = 1000.f / (t1 - t0);
-        t0 = t1;
-
-        for (int i = 9; i >= 1; i--)
-        {
-            fps_history[i] = fps_history[i - 1];
-        }
-        fps_history[0] = fps;
-
-        if (fps_history[9] == 0.f)
-        {
-            return 0;
-        }
-
-        for (int i = 0; i < 10; i++)
-        {
-            avg_fps += fps_history[i];
-        }
-        avg_fps /= 10.f;
-    }
-
-    char text[32];
-    sprintf(text, "FPS=%.2f", avg_fps);
-
-    int baseLine = 0;
-    cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
-    int y = 0;
-    int x = rgb.cols - label_size.width;
-
-    cv::rectangle(rgb, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)),
-                  cv::Scalar(255, 255, 255), -1);
-    cv::putText(rgb, text, cv::Point(x, y + label_size.height),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
-
-    return 0;
-}
-
-static NanoDet* g_nanodet = 0;
-static ncnn::Mutex lock;
-
-class MyNdkCamera : public NdkCameraWindow
-{
-public:
-    virtual void on_image_render(cv::Mat& rgb) const;
+struct Object {
+    cv::Rect_<float> rect;
+    int label;
+    float prob;
 };
 
-void MyNdkCamera::on_image_render(cv::Mat& rgb) const
-{
-    {
-        ncnn::MutexLockGuard g(lock);
-        if (g_nanodet)
-        {
-            std::vector<Object> objects;
-            g_nanodet->detect(rgb, objects);
-            g_nanodet->draw(rgb, objects);
+static ncnn::Net g_net;
+static bool g_loaded = false;
+static const int NUM_CLASS = 80;
+static const float PROB_THRESHOLD = 0.40f;
+static const float NMS_THRESHOLD = 0.50f;
+
+static inline float fast_exp(float x) {
+    return std::exp(x);
+}
+
+static void softmax(const float* src, float* dst, int length) {
+    float alpha = -FLT_MAX;
+    for (int i = 0; i < length; i++) {
+        if (src[i] > alpha) alpha = src[i];
+    }
+    float denominator = 0.f;
+    for (int i = 0; i < length; i++) {
+        dst[i] = fast_exp(src[i] - alpha);
+        denominator += dst[i];
+    }
+    if (denominator <= 0.f) denominator = 1.f;
+    for (int i = 0; i < length; i++) {
+        dst[i] /= denominator;
+    }
+}
+
+static float intersection_area(const Object& a, const Object& b) {
+    cv::Rect_<float> inter = a.rect & b.rect;
+    return inter.area();
+}
+
+static void qsort_descent_inplace(std::vector<Object>& objects, int left, int right) {
+    int i = left;
+    int j = right;
+    float p = objects[(left + right) / 2].prob;
+
+    while (i <= j) {
+        while (objects[i].prob > p) i++;
+        while (objects[j].prob < p) j--;
+        if (i <= j) {
+            std::swap(objects[i], objects[j]);
+            i++;
+            j--;
         }
-        else
-        {
-            draw_unsupported(rgb);
+    }
+
+    if (left < j) qsort_descent_inplace(objects, left, j);
+    if (i < right) qsort_descent_inplace(objects, i, right);
+}
+
+static void qsort_descent_inplace(std::vector<Object>& objects) {
+    if (objects.empty()) return;
+    qsort_descent_inplace(objects, 0, (int)objects.size() - 1);
+}
+
+static void nms_sorted_bboxes(const std::vector<Object>& objects, std::vector<int>& picked, float nms_threshold) {
+    picked.clear();
+    const int n = (int)objects.size();
+    std::vector<float> areas(n);
+    for (int i = 0; i < n; i++) {
+        areas[i] = objects[i].rect.area();
+    }
+
+    for (int i = 0; i < n; i++) {
+        const Object& a = objects[i];
+        int keep = 1;
+        for (int j : picked) {
+            const Object& b = objects[j];
+            float inter_area = intersection_area(a, b);
+            float union_area = areas[i] + areas[j] - inter_area;
+            if (union_area <= 0.f) continue;
+            if (inter_area / union_area > nms_threshold) {
+                keep = 0;
+                break;
+            }
         }
+        if (keep) picked.push_back(i);
+    }
+}
+
+static void generate_proposals(const ncnn::Mat& cls_pred,
+                               const ncnn::Mat& dis_pred,
+                               int stride,
+                               int in_pad_w,
+                               int in_pad_h,
+                               float prob_threshold,
+                               std::vector<Object>& objects) {
+    const int num_grid_x = in_pad_w / stride;
+    const int num_grid_y = in_pad_h / stride;
+    const int num_points = num_grid_x * num_grid_y;
+
+    if (cls_pred.dims != 2 || dis_pred.dims != 2) {
+        return;
     }
 
-    draw_fps(rgb);
-}
+    int cls_w = cls_pred.w;
+    int cls_h = cls_pred.h;
+    int dis_w = dis_pred.w;
+    int dis_h = dis_pred.h;
 
-static MyNdkCamera* g_camera = 0;
-
-static jfloatArray make_empty_result(JNIEnv* env)
-{
-    return env->NewFloatArray(0);
-}
-
-extern "C" {
-
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
-{
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "JNI_OnLoad");
-    g_camera = new MyNdkCamera;
-    return JNI_VERSION_1_4;
-}
-
-JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
-{
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "JNI_OnUnload");
-
-    {
-        ncnn::MutexLockGuard g(lock);
-        delete g_nanodet;
-        g_nanodet = 0;
+    if (cls_h < num_points || dis_h < num_points || cls_w < NUM_CLASS || dis_w < 4) {
+        return;
     }
 
-    delete g_camera;
-    g_camera = 0;
+    int reg_max_1 = dis_w / 4;
+    if (reg_max_1 <= 0) return;
+
+    std::vector<float> dis_after_sm(reg_max_1);
+
+    for (int idx = 0; idx < num_points; idx++) {
+        const int y = idx / num_grid_x;
+        const int x = idx % num_grid_x;
+
+        const float* scores = cls_pred.row(idx);
+
+        int label = -1;
+        float score = prob_threshold;
+        for (int c = 0; c < NUM_CLASS; c++) {
+            if (scores[c] > score) {
+                score = scores[c];
+                label = c;
+            }
+        }
+
+        if (label < 0) continue;
+
+        const float* bbox_pred = dis_pred.row(idx);
+        float dis_pred_values[4];
+
+        for (int k = 0; k < 4; k++) {
+            softmax(bbox_pred + k * reg_max_1, dis_after_sm.data(), reg_max_1);
+            float dis = 0.f;
+            for (int l = 0; l < reg_max_1; l++) {
+                dis += l * dis_after_sm[l];
+            }
+            dis_pred_values[k] = dis * stride;
+        }
+
+        float cx = (x + 0.5f) * stride;
+        float cy = (y + 0.5f) * stride;
+        float x0 = cx - dis_pred_values[0];
+        float y0 = cy - dis_pred_values[1];
+        float x1 = cx + dis_pred_values[2];
+        float y1 = cy + dis_pred_values[3];
+
+        Object obj;
+        obj.rect.x = x0;
+        obj.rect.y = y0;
+        obj.rect.width = x1 - x0;
+        obj.rect.height = y1 - y0;
+        obj.label = label;
+        obj.prob = score;
+        objects.push_back(obj);
+    }
 }
 
-JNIEXPORT jboolean JNICALL Java_com_tencent_nanodetncnn_NanoDetNcnn_loadModel(JNIEnv* env, jobject thiz, jobject assetManager, jint modelid, jint cpugpu)
-{
-    if (modelid < 0 || modelid > 6 || cpugpu < 0 || cpugpu > 1)
-    {
-        return JNI_FALSE;
-    }
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_tencent_nanodetncnn_NanoDetNcnn_loadModel(JNIEnv* env, jobject thiz, jobject assetManager, jint modelid, jint cpugpu) {
+    (void)env;
+    (void)thiz;
+    (void)modelid;
+    (void)cpugpu;
 
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "loadModel %p", mgr);
+    if (!mgr) return JNI_FALSE;
 
-    const char* modeltypes[] =
-    {
-        "m",
-        "m-416",
-        "g",
-        "ELite0_320",
-        "ELite1_416",
-        "ELite2_512",
-        "RepVGG-A0_416"
-    };
+    g_net.clear();
+    g_net.opt.use_vulkan_compute = false;
+    g_net.opt.num_threads = 2;
+    g_net.opt.use_fp16_arithmetic = true;
+    g_net.opt.use_packing_layout = true;
 
-    const int target_sizes[] =
-    {
-        320,
-        416,
-        416,
-        320,
-        416,
-        512,
-        416
-    };
+    const char* param = "nanodet-ELite0_320.param";
+    const char* bin = "nanodet-ELite0_320.bin";
 
-    const float mean_vals[][3] =
-    {
-        {103.53f, 116.28f, 123.675f},
-        {103.53f, 116.28f, 123.675f},
-        {103.53f, 116.28f, 123.675f},
-        {127.f, 127.f, 127.f},
-        {127.f, 127.f, 127.f},
-        {127.f, 127.f, 127.f},
-        {103.53f, 116.28f, 123.675f}
-    };
-
-    const float norm_vals[][3] =
-    {
-        {1.f / 57.375f, 1.f / 57.12f, 1.f / 58.395f},
-        {1.f / 57.375f, 1.f / 57.12f, 1.f / 58.395f},
-        {1.f / 57.375f, 1.f / 57.12f, 1.f / 58.395f},
-        {1.f / 128.f, 1.f / 128.f, 1.f / 128.f},
-        {1.f / 128.f, 1.f / 128.f, 1.f / 128.f},
-        {1.f / 128.f, 1.f / 128.f, 1.f / 128.f},
-        {1.f / 57.375f, 1.f / 57.12f, 1.f / 58.395f}
-    };
-
-    const char* modeltype = modeltypes[(int)modelid];
-    int target_size = target_sizes[(int)modelid];
-    bool use_gpu = (int)cpugpu == 1;
-
-    {
-        ncnn::MutexLockGuard g(lock);
-
-        if (use_gpu && ncnn::get_gpu_count() == 0)
-        {
-            delete g_nanodet;
-            g_nanodet = 0;
-        }
-        else
-        {
-            if (!g_nanodet)
-                g_nanodet = new NanoDet;
-
-            g_nanodet->load(mgr, modeltype, target_size, mean_vals[(int)modelid], norm_vals[(int)modelid], use_gpu);
-        }
-    }
-
-    return JNI_TRUE;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_tencent_nanodetncnn_NanoDetNcnn_openCamera(JNIEnv* env, jobject thiz, jint facing)
-{
-    if (facing < 0 || facing > 1)
+    int ret1 = g_net.load_param(mgr, param);
+    int ret2 = g_net.load_model(mgr, bin);
+    if (ret1 != 0 || ret2 != 0) {
+        LOGE("load model failed param=%d bin=%d", ret1, ret2);
+        g_loaded = false;
         return JNI_FALSE;
+    }
 
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "openCamera %d", facing);
-
-    if (g_camera)
-        g_camera->open((int)facing);
-
+    g_loaded = true;
+    LOGI("model loaded");
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_tencent_nanodetncnn_NanoDetNcnn_closeCamera(JNIEnv* env, jobject thiz)
-{
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "closeCamera");
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_tencent_nanodetncnn_NanoDetNcnn_detectRGBA(JNIEnv* env, jobject thiz, jobject rgbaBuffer,
+                                                    jint width, jint height, jint rowStride, jint targetSize) {
+    (void)thiz;
 
-    if (g_camera)
-        g_camera->close();
+    std::vector<float> empty;
+    empty.push_back((float)std::max(1, (int)width));
+    empty.push_back((float)std::max(1, (int)height));
 
-    return JNI_TRUE;
-}
+    if (!g_loaded || rgbaBuffer == nullptr || width <= 0 || height <= 0 || rowStride <= 0) {
+        jfloatArray arr = env->NewFloatArray((jsize)empty.size());
+        env->SetFloatArrayRegion(arr, 0, (jsize)empty.size(), empty.data());
+        return arr;
+    }
 
-JNIEXPORT jboolean JNICALL Java_com_tencent_nanodetncnn_NanoDetNcnn_setOutputWindow(JNIEnv* env, jobject thiz, jobject surface)
-{
-    ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
-    __android_log_print(ANDROID_LOG_DEBUG, "ncnn", "setOutputWindow %p", win);
+    unsigned char* rgba = (unsigned char*)env->GetDirectBufferAddress(rgbaBuffer);
+    if (!rgba) {
+        jfloatArray arr = env->NewFloatArray((jsize)empty.size());
+        env->SetFloatArrayRegion(arr, 0, (jsize)empty.size(), empty.data());
+        return arr;
+    }
 
-    if (g_camera)
-        g_camera->set_window(win);
-
-    return JNI_TRUE;
-}
-
-// public native float[] detectBitmap(Bitmap bitmap);
-// return: [srcW, srcH, label, prob, x, y, w, h, ...]
-JNIEXPORT jfloatArray JNICALL Java_com_tencent_nanodetncnn_NanoDetNcnn_detectBitmap(JNIEnv* env, jobject thiz, jobject bitmap)
-{
-    if (bitmap == 0)
-        return make_empty_result(env);
-
-    AndroidBitmapInfo info;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0)
-        return make_empty_result(env);
-
-    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888)
-        return make_empty_result(env);
-
-    void* pixels = 0;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0 || pixels == 0)
-        return make_empty_result(env);
-
-    cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, pixels);
+    cv::Mat rgba_full(height, rowStride / 4, CV_8UC4, rgba);
+    cv::Mat rgba_crop = rgba_full(cv::Rect(0, 0, width, height));
     cv::Mat rgb;
-    cv::cvtColor(rgba, rgb, cv::COLOR_RGBA2RGB);
+    cv::cvtColor(rgba_crop, rgb, cv::COLOR_RGBA2RGB);
 
-    AndroidBitmap_unlockPixels(env, bitmap);
+    int input_size = targetSize > 0 ? targetSize : 320;
+    if (input_size < 160) input_size = 320;
 
-    std::vector<Object> objects;
-    {
-        ncnn::MutexLockGuard g(lock);
-        if (!g_nanodet)
-        {
-            return make_empty_result(env);
+    int img_w = rgb.cols;
+    int img_h = rgb.rows;
+    float scale = std::min((float)input_size / img_w, (float)input_size / img_h);
+    int new_w = (int)(img_w * scale);
+    int new_h = (int)(img_h * scale);
+
+    cv::Mat resized;
+    cv::resize(rgb, resized, cv::Size(new_w, new_h));
+
+    int wpad = input_size - new_w;
+    int hpad = input_size - new_h;
+    int left = wpad / 2;
+    int right = wpad - left;
+    int top = hpad / 2;
+    int bottom = hpad - top;
+
+    cv::Mat padded;
+    cv::copyMakeBorder(resized, padded, top, bottom, left, right, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+
+    ncnn::Mat in = ncnn::Mat::from_pixels(padded.data, ncnn::Mat::PIXEL_RGB, padded.cols, padded.rows);
+    const float mean_vals[3] = {103.53f, 116.28f, 123.675f};
+    const float norm_vals[3] = {0.017429f, 0.017507f, 0.017125f};
+    in.substract_mean_normalize(mean_vals, norm_vals);
+
+    ncnn::Extractor ex = g_net.create_extractor();
+    ex.input("input.1", in);
+
+    std::vector<Object> proposals;
+    const int strides[3] = {8, 16, 32};
+    const char* cls_names[3] = {"cls_pred_stride_8", "cls_pred_stride_16", "cls_pred_stride_32"};
+    const char* dis_names[3] = {"dis_pred_stride_8", "dis_pred_stride_16", "dis_pred_stride_32"};
+
+    for (int i = 0; i < 3; i++) {
+        ncnn::Mat cls_pred;
+        ncnn::Mat dis_pred;
+        int retc = ex.extract(cls_names[i], cls_pred);
+        int retd = ex.extract(dis_names[i], dis_pred);
+        if (retc == 0 && retd == 0) {
+            generate_proposals(cls_pred, dis_pred, strides[i], input_size, input_size, PROB_THRESHOLD, proposals);
         }
-        g_nanodet->detect(rgb, objects, 0.35f, 0.5f);
     }
 
-    const int max_objects = 80;
-    const int count = std::min((int)objects.size(), max_objects);
-    const int item_size = 6;
-    const int out_size = 2 + count * item_size;
-    std::vector<float> out(out_size);
-    out[0] = (float)info.width;
-    out[1] = (float)info.height;
+    qsort_descent_inplace(proposals);
+    std::vector<int> picked;
+    nms_sorted_bboxes(proposals, picked, NMS_THRESHOLD);
 
-    for (int i = 0; i < count; i++)
-    {
-        const Object& obj = objects[i];
-        const int base = 2 + i * item_size;
-        out[base] = (float)obj.label;
-        out[base + 1] = obj.prob;
-        out[base + 2] = obj.rect.x;
-        out[base + 3] = obj.rect.y;
-        out[base + 4] = obj.rect.width;
-        out[base + 5] = obj.rect.height;
+    std::vector<float> out;
+    out.reserve(2 + picked.size() * 6);
+    out.push_back((float)img_w);
+    out.push_back((float)img_h);
+
+    const int max_objects = 50;
+    int count = 0;
+    for (int idx : picked) {
+        if (count >= max_objects) break;
+        Object obj = proposals[idx];
+
+        float x0 = (obj.rect.x - left) / scale;
+        float y0 = (obj.rect.y - top) / scale;
+        float x1 = (obj.rect.x + obj.rect.width - left) / scale;
+        float y1 = (obj.rect.y + obj.rect.height - top) / scale;
+
+        x0 = std::max(0.f, std::min(x0, (float)(img_w - 1)));
+        y0 = std::max(0.f, std::min(y0, (float)(img_h - 1)));
+        x1 = std::max(0.f, std::min(x1, (float)(img_w - 1)));
+        y1 = std::max(0.f, std::min(y1, (float)(img_h - 1)));
+
+        float bw = x1 - x0;
+        float bh = y1 - y0;
+        if (bw <= 2.f || bh <= 2.f) continue;
+
+        out.push_back((float)obj.label);
+        out.push_back(obj.prob);
+        out.push_back(x0);
+        out.push_back(y0);
+        out.push_back(bw);
+        out.push_back(bh);
+        count++;
     }
 
-    jfloatArray jret = env->NewFloatArray(out_size);
-    env->SetFloatArrayRegion(jret, 0, out_size, out.data());
-    return jret;
-}
-
+    jfloatArray arr = env->NewFloatArray((jsize)out.size());
+    env->SetFloatArrayRegion(arr, 0, (jsize)out.size(), out.data());
+    return arr;
 }
